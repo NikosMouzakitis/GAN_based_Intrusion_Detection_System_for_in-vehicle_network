@@ -16,6 +16,7 @@ def one_hot_vector(a):
         ret[hex_map.index(a)] = 1
     return ret
 
+
 def create_CAN_image(s):
     '''Create the CAN image (3x16 matrix) for a given CAN ID.'''
     # Chop off the first character and use the remaining 3 characters
@@ -50,6 +51,12 @@ with open("DOS_IDS.txt", "r") as f:
 # Convert to CAN Images
 normal_CAN_images = [create_CAN_image(can_id) for can_id in ids_normal_list]
 intrusion_CAN_images = [create_CAN_image(can_id) for can_id in ids_intrusion_list]
+print(normal_CAN_images[0])
+plt.figure(1)
+plt.imshow(create_64batch_Discriminator(normal_CAN_images[0:64]),cmap="binary")
+plt.title("A discriminator's batch")
+plt.show()
+
 
 # Prepare batches (ensure they are 64-multiples)
 normal_batches = [torch.tensor(create_64batch_Discriminator(normal_CAN_images[i:i+64]), dtype=torch.float32)
@@ -57,25 +64,59 @@ normal_batches = [torch.tensor(create_64batch_Discriminator(normal_CAN_images[i:
 intrusion_batches = [torch.tensor(create_64batch_Discriminator(intrusion_CAN_images[i:i+64]), dtype=torch.float32)
                      for i in range(0, len(intrusion_CAN_images) - (len(intrusion_CAN_images) % 64), 64)]
 
+
 # ===========================
 # Generator Architecture (Based on Paper)
 # ===========================
 class Generator(nn.Module):
-    def __init__(self, input_dim=100):
+    def __init__(self, latent_dim=100):
         super(Generator, self).__init__()
+        
         self.model = nn.Sequential(
-            nn.Linear(input_dim, 256),  # First fully connected layer
+            # Input: latent_dim (100) → Output: 256x4x3
+            nn.Linear(latent_dim, 256 * 4 * 3),
             nn.ReLU(),
-            nn.Linear(256, 512),        # Second fully connected layer
-            nn.ReLU(),
-            nn.Linear(512, 48),         # Output layer (3x16 flattened to 48)
-            nn.Sigmoid()                 # Sigmoid activation (range [0, 1] for binary output)
+            nn.Unflatten(1, (256, 4, 3)),  # Reshape to 4x3 spatial dimensions with 256 channels
+            
+            # Layer 1: Transposed Convolution (Upsampling) → Output: 128x8x6
+            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2),
+
+            # Layer 2: Transposed Convolution (Upsampling) → Output: 64x16x12
+            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2),
+
+            # Layer 3: Transposed Convolution (Upsampling) → Output: 32x32x24
+            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2),
+
+            # Layer 4: Transposed Convolution (Upsampling) → Output: 1x64x48 (Final CAN image)
+            nn.ConvTranspose2d(32, 1, kernel_size=(4, 4), stride=(2, 2), padding=(1, 1)),
+            nn.Tanh()  # Output values scaled to [-1, 1]
         )
-    
+        
+        # Apply Xavier Normal Initialization to weights
+        self._initialize_weights()
+
     def forward(self, z):
-        # Apply sigmoid and round to ensure binary output
-        output = self.model(z).reshape(-1, 3, 16)  # Reshape into 3x16 (CAN image)
-        return torch.round(output)  # Ensure output is binary (0 or 1)
+        """
+        Forward pass to generate the image.
+        Only at the final step, normalize the output to [0, 1] and apply threshold to get binary output.
+        """
+        output = self.model(z)
+        # Apply normalization and thresholding only to the final output:
+        output = (output + 1) / 2  # Normalize from [-1, 1] to [0, 1]
+        output = torch.where(output >= 0.5, torch.tensor(1.0), torch.tensor(0.0))  # Threshold to get binary values
+        return output
+
+    def _initialize_weights(self):
+        # Initialize weights using Xavier Normal initialization
+        for m in self.model.modules():
+            if isinstance(m, nn.ConvTranspose2d) or isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
 
 # ===========================
 # Discriminator Architecture (Based on Paper)
@@ -84,129 +125,151 @@ class Discriminator(nn.Module):
     def __init__(self):
         super(Discriminator, self).__init__()
         self.model = nn.Sequential(
-            nn.Flatten(),                   # Flatten input (48-dimensional vector)
-            nn.Linear(48, 512),             # First fully connected layer (48 input)
+            # First Linear layer expects a 3072-dimensional vector (flattened image)
+            nn.Linear(3072, 1536),  # Input size of 3072 (flattened from 64x48), output 1536
             nn.ReLU(),
-            nn.Linear(512, 256),            # Second fully connected layer
+            nn.Linear(1536, 768),   # Reduce to 768
             nn.ReLU(),
-            nn.Linear(256, 1),              # Output layer (binary classification)
-            nn.Sigmoid()                    # Sigmoid for output probability
+            nn.Linear(768, 1),      # Output layer (single value: real or fake)
+            nn.Sigmoid()            # Sigmoid for binary classification (0 or 1)
         )
     
     def forward(self, x):
-        return self.model(x)
+        # Flatten the input only for the first layer (64x48 -> 3072)
+        x = x.view(x.size(0), -1)  # Flatten each image to 3072 features (batch_size, 3072)
+        return self.model(x)  # Pass through the model
+
+
+
+
+
+# Example usage for generating a single fake CAN image
+latent_dim = 100
+generator = Generator(latent_dim=latent_dim)
+
+# Generate a single fake CAN image
+random_noise = torch.randn(1, latent_dim)  # Single random noise vector
+fake_image = generator(random_noise)  # Output shape is [1, 64, 48], values are 0 or 1
+
+# Remove batch and channel dimensions
+fake_image = fake_image.squeeze(0).squeeze(0).detach().numpy()  # Output shape [64, 48]
+
+# Visualize the binary fake CAN image
+plt.figure(figsize=(8, 6))
+plt.imshow(fake_image, cmap="binary")  # Visualize the binary 64x48 fake CAN image
+plt.title("Fake CAN Image (Generated by Generator)")
+plt.colorbar()  # Add a color bar to see intensity values (0 or 1)
+plt.show()
+
+
+
+
+
+import torch
+import torch.optim as optim
+import torch.nn as nn
 
 # Initialize models
-generator = Generator(input_dim=100)
-discriminator = Discriminator()
+generator = Generator(latent_dim=100)
+first_discriminator = Discriminator()  # First Discriminator for known attacks
+second_discriminator = Discriminator()  # Second Discriminator for unknown attacks
 
-# Optimizers and loss function
-g_optimizer = optim.Adam(generator.parameters(), lr=0.0002)
-d_optimizer = optim.Adam(discriminator.parameters(), lr=0.0002)
-criterion = nn.BCELoss()
+# Optimizers
+optimizer_g = optim.Adam(generator.parameters(), lr=0.0002, betas=(0.5, 0.999))
+optimizer_d1 = optim.Adam(first_discriminator.parameters(), lr=0.0002, betas=(0.5, 0.999))
+optimizer_d2 = optim.Adam(second_discriminator.parameters(), lr=0.0002, betas=(0.5, 0.999))
 
-# ===========================
-# Train the GAN
-# ===========================
-def old_train_gan(generator, discriminator, normal_batches, epochs=10000, batch_size=64):
-    '''Train the GAN using normal CAN data.'''
-    d_losses = []
-    g_losses = []
-    fake_data = None  # Initialize fake_data for visualization later
+# Loss function
+criterion = nn.BCELoss()  # Binary Cross-Entropy loss for binary classification
 
-    for epoch in range(epochs):
-        # Select a random batch
-        idx = np.random.randint(0, len(normal_batches))
-        real_data = normal_batches[idx]
+# Training loop
+num_epochs = 100
+ide = 0
+for epoch in range(num_epochs):
+    print("epoch "+str(ide))
+    ide+=1
+    for normal_data, attack_data in zip(normal_batches, intrusion_batches):  # Assuming batches are prepared
+       # print("RUN---")
+        batch_size = normal_data.size(0)
 
-        # Generate fake CAN images
-        noise = torch.randn(batch_size, 100)  # Random noise
-        fake_data = generator(noise)
-
-        # Labels for real and fake data
-        real_labels = torch.ones((batch_size, 1))
-        fake_labels = torch.zeros((batch_size, 1))
-
-        # Train the discriminator
-        discriminator.train()
-        d_optimizer.zero_grad()
-        real_loss = criterion(discriminator(real_data), real_labels)
-        fake_loss = criterion(discriminator(fake_data.detach()), fake_labels)
-        d_loss = real_loss + fake_loss
-        d_loss.backward()
-        d_optimizer.step()
-
-        # Train the generator
-        generator.train()
-        g_optimizer.zero_grad()
-        g_loss = criterion(discriminator(fake_data), real_labels)
-        g_loss.backward()
-        g_optimizer.step()
-
-        # Store loss values
-        d_losses.append(d_loss.item())
-        g_losses.append(g_loss.item())
-
-        # Print progress
-        if epoch % 1000 == 0:
-            print(f"{epoch} [D loss: {d_loss.item():.4f}] [G loss: {g_loss.item():.4f}]")
-
-    return d_losses, g_losses, fake_data
+        # Step 1: Train the First Discriminator (Known Attacks)
+        first_discriminator.train()
+        optimizer_d1.zero_grad()
 
 
-def train_gan(generator, discriminator, normal_batches, epochs=10000, batch_size=64):
-    '''Train the GAN using normal CAN data.'''
-    d_losses = []
-    g_losses = []
-    fake_data = None  # Initialize fake_data for visualization later
+        # Real labels for normal data (1) --> Only one label for the entire batch
+        real_labels = torch.ones(1, 1)  # Shape: (1, 1) for the entire batch
+        # Fake labels for attack data (0) --> Only one label for the entire batch
+        fake_labels = torch.zeros(1, 1)  # Shape: (1, 1) for the entire batch
 
-    for epoch in range(epochs):
-        # Select a random batch
-        idx = np.random.randint(0, len(normal_batches))
-        real_data = normal_batches[idx]
 
-        # Generate fake CAN images
-        noise = torch.randn(batch_size, 100)  # Random noise
-        fake_data = generator(noise)
+        normal_data = normal_data.reshape(1,-1)
+        attack_data = attack_data.reshape(1,-1)
 
-        # Labels for real and fake data with label smoothing
-        real_labels = torch.full((batch_size, 1), 0.9)  # Smoothed real labels
-        fake_labels = torch.full((batch_size, 1), 0.1)  # Smoothed fake labels
+         # Train on normal data
+        output_real = first_discriminator(normal_data)  # Passes through forward(), which flattens internally
+        loss_real = criterion(output_real, real_labels)
 
-        # Train the discriminator
-        discriminator.train()
-        d_optimizer.zero_grad()  # Zero the discriminator's gradients
-        real_loss = criterion(discriminator(real_data), real_labels)  # loss for real data
-        fake_loss = criterion(discriminator(fake_data.detach()), fake_labels)  # loss for fake data
-        d_loss = real_loss + fake_loss  # Total loss for the Discriminator
-        d_loss.backward()  # Backpropagation for the Discriminator
-        d_optimizer.step()  # Update Discriminator's weights
+        # Train on attack data
+        output_fake = first_discriminator(attack_data)  # Passes through forward(), which flattens internally
+        loss_fake = criterion(output_fake, fake_labels)
 
-        # Train the generator
-        generator.train()
-        g_optimizer.zero_grad()  # Zero the generator's gradients
-        g_loss = criterion(discriminator(fake_data), real_labels)  # Fake data should be classified as real
-        g_loss.backward()  # Backpropagation for the Generator
-        g_optimizer.step()  # Update Generator's weights
+        #print(f"First Discriminator - Real Data: {output_real.item()} (Real label: 1)")
+        #print(f"First Discriminator - Fake Data: {output_fake.item()} (Fake label: 0)")
 
-        # Store loss values for later plotting
-        d_losses.append(d_loss.item())
-        g_losses.append(g_loss.item())
 
-        # Print progress every 1000 epochs
-        if epoch % 1000 == 0:
-            print(f"{epoch} [D loss: {d_loss.item():.4f}] [G loss: {g_loss.item():.4f}]")
+        # Backprop and update First Discriminator
+        loss_d1 = loss_real + loss_fake
+        loss_d1.backward()
+        optimizer_d1.step()
 
-    return d_losses, g_losses, fake_data
+        # Step 2: Train the Generator and Second Discriminator (Unknown Attacks)
+        noise = torch.randn(1, 100)  # Latent vector for Generator
+        fake_images = generator(noise)  # Generate fake images
+       # fake_images = fake_images.squeeze(0).squeeze(0).detach().numpy()  # Output shape [64, 48]
 
-# Train the GAN
-d_losses, g_losses, fake_data = train_gan(generator, discriminator, normal_batches)
+        optimizer_g.zero_grad()
+        optimizer_d2.zero_grad()
+        #print(normal_data.shape)
+       #print(fake_images.shape)
 
+        # Train the Second Discriminator with real and fake images
+        output_real_d2 = second_discriminator(normal_data)  # Pass through forward(), which flattens internally
+        #print(output_real_d2)
+        output_fake_d2 = second_discriminator(fake_images)  # Pass through forward(), which flattens internally
+
+        loss_real_d2 = criterion(output_real_d2, real_labels)
+        loss_fake_d2 = criterion(output_fake_d2, fake_labels)
+
+        # Backprop and update Second Discriminator
+        loss_d2 = loss_real_d2 + loss_fake_d2
+        loss_d2.backward()
+        optimizer_d2.step()
+
+        # Train the Generator to fool the Second Discriminator
+        output_fake_g = second_discriminator(fake_images)  # Pass through forward(), which flattens internally
+        loss_g = criterion(output_fake_g, real_labels)  # Generator wants to fool D into thinking it's real
+        loss_g.backward()
+        optimizer_g.step()
+
+    # Print progress for each epoch
+    print(f"Epoch [{epoch+1}/{num_epochs}] | D1 Loss: {loss_d1.item()} | D2 Loss: {loss_d2.item()} | G Loss: {loss_g.item()}")
+
+
+
+
+
+
+
+
+
+
+'''
 # ===========================
 # Evaluate Model (Intrusion and Normal Classification)
 # ===========================
 def evaluate_model_with_percentages(discriminator, normal_batches, intrusion_batches):
-    '''Evaluate the GAN's ability to classify real vs. fake CAN IDs and detect intrusions.'''
+    #Evaluate the GAN's ability to classify real vs. fake CAN IDs and detect intrusions.
 
     # Track correct classifications
     intrusion_true_positive = 0
@@ -273,3 +336,4 @@ def evaluate_model_with_percentages(discriminator, normal_batches, intrusion_bat
 # Example of evaluating the model
 evaluate_model_with_percentages(discriminator, normal_batches, intrusion_batches)
 
+'''
